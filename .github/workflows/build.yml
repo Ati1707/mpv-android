@@ -8,40 +8,114 @@ jobs:
   linux:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          java-version: '17'
-          distribution: temurin
+          submodules: 'recursive' # Important if your deps (like mpv source) are submodules
 
-      - name: Export env vars
-        run: buildscripts/include/ci.sh export >>$GITHUB_ENV
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17' # mpv-android often uses Java 17 for Gradle
+          distribution: 'temurin'
 
-      - uses: actions/cache@v4
+      - name: Export env vars for caching
+        # This reads ci_tarball from depinfo.sh and sets CACHE_IDENTIFIER
+        run: buildscripts/include/ci.sh export >> $GITHUB_ENV
+
+      - name: Cache build dependencies (gh-cache including multi-arch prefixes)
+        uses: actions/cache@v4
+        id: gh-cache # Give an id to check cache hit status
         with:
           path: gh-cache/
-          key: "${{ env.CACHE_IDENTIFIER }}"
-          enableCrossOsArchive: true
+          key: ${{ runner.os }}-gradle-${{ env.CACHE_IDENTIFIER }} # CACHE_IDENTIFIER from ci.sh export
+          restore-keys: |
+            ${{ runner.os }}-gradle-${{ env.CACHE_IDENTIFIER }}
+            ${{ runner.os }}-gradle-
+          enableCrossOsArchive: true # Should be true for consistency
 
-      - name: Install deps
+      - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install autoconf pkg-config libtool ninja-build python3-pip
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            autoconf \
+            pkg-config \
+            libtool \
+            ninja-build \
+            python3-pip \
+            wget \
+            unzip \
+            zip \
+            p7zip-full # For .7z if any script uses it
+
           sudo pip3 install meson
 
-      - name: Download deps
+      - name: Set ANDROID_HOME and NDK paths
+        run: |
+          echo "ANDROID_SDK_ROOT=${{ github.workspace }}/sdk/android-sdk-linux" >> $GITHUB_ENV
+          echo "ANDROID_HOME=${{ github.workspace }}/sdk/android-sdk-linux" >> $GITHUB_ENV
+          # Assuming NDK is installed by download-sdk.sh into a known relative path
+          # Adjust if your NDK path is different after download-sdk.sh runs
+          echo "ANDROID_NDK_HOME=${{ github.workspace }}/sdk/android-ndk-${{ env.v_ndk_n }}" >> $GITHUB_ENV # v_ndk_n from depinfo.sh
+          echo "PATH=${{ github.workspace }}/sdk/android-sdk-linux/cmdline-tools/latest/bin:${{ github.workspace }}/sdk/android-sdk-linux/platform-tools:${{ github.workspace }}/sdk/android-sdk-linux/emulator:${{ github.workspace }}/sdk/android-ndk-${{ env.v_ndk_n }}:$PATH" >> $GITHUB_ENV
+        env:
+          # v_ndk_n should be available if depinfo.sh is sourced or its vars exported.
+          # Let's assume ci.sh install (download-sdk.sh) will create the NDK dir with this version name.
+          # This requires depinfo.sh to be sourced before this step or its variables made available.
+          # For simplicity, we'll rely on ci.sh install step to setup SDK/NDK before build.
+          # We can hardcode v_ndk_n here if needed for PATH setting, but it's better if it's dynamic.
+          # The Export env vars step should make depinfo.sh vars available to later steps if it exports them.
+          # The CACHE_IDENTIFIER export doesn't export all vars from depinfo.sh.
+          # A better way: source depinfo.sh here.
+          source buildscripts/include/depinfo.sh
+          echo "ANDROID_NDK_HOME=${{ github.workspace }}/sdk/android-ndk-${v_ndk_n}" >> $GITHUB_ENV
+          echo "PATH=${{ github.workspace }}/sdk/android-sdk-linux/cmdline-tools/latest/bin:${{ github.workspace }}/sdk/android-sdk-linux/platform-tools:${{ github.workspace }}/sdk/android-sdk-linux/emulator:${{ github.workspace }}/sdk/android-ndk-${v_ndk_n}:$PATH" >> $GITHUB_ENV
+
+
+      - name: Download and build native dependencies (all architectures)
         run: |
           mkdir -p "$CACHE_FOLDER"
+          # ci.sh install will:
+          # 1. Download SDK/NDK (download-sdk.sh)
+          # 2. Download mpv source
+          # 3. Call fetch_prefix or build_prefix. build_prefix builds deps for ALL ARCHS_TO_BUILD.
           buildscripts/include/ci.sh install
         env:
           CACHE_MODE: "folder"
           CACHE_FOLDER: "${{ github.workspace }}/gh-cache"
+          # ANDROID_HOME and ANDROID_NDK_HOME should be set from previous step
 
-      - name: Build
+      - name: Build mpv (all archs) and then mpv-android (universal release APK)
         run: |
+          # ci.sh build will:
+          # 1. Build mpv.so for all ARCHS_TO_BUILD.
+          # 2. Call buildall.sh -n (for mpv-android target), which runs scripts/mpv-android.sh.
+          # scripts/mpv-android.sh should build assembleRelease as DONT_BUILD_RELEASE is not set.
+          # It will also use the jniLibs populated by ndk-build using the multi-arch prefixes.
           buildscripts/include/ci.sh build
+        env:
+          # ANDROID_HOME and ANDROID_NDK_HOME should be set
+          # DONT_BUILD_RELEASE is not set, so release APKs will be built.
+          # If your scripts/mpv-android.sh requires ANDROID_SIGNING_KEY for release,
+          # you'll need to set it up using secrets.
+          # For now, assuming it can build unsigned or with a debug key for CI.
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY_PATH }} # Example: if you use a secret for keystore path
+          ANDROID_SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }} # Often same as key password
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
-      - uses: actions/upload-artifact@v4
+      - name: List generated APKs
+        if: always() # Run even if previous steps fail, to help debug
+        run: |
+          find app/build/outputs/apk -name "*.apk" -ls || echo "No APKs found."
+          find app/build/outputs/bundle -name "*.aab" -ls || echo "No AABs found."
+
+      - name: Upload Universal Release APK
+        uses: actions/upload-artifact@v4
         with:
-          name: mpv-android
-          path: app/build/outputs/apk/default/release/*
+          name: mpv-android-universal-release
+          # Based on your build.gradle (splits { abi { universalApk true } }) and default flavor:
+          # The universal APK for 'default' flavor release build.
+          # The * might catch -unsigned or -signed if your signing process renames it.
+          path: app/build/outputs/apk/default/release/app-default*-universal-release.apk
+          if-no-files-found: error # Fails the workflow if the APK is not found
